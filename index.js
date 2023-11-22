@@ -4,7 +4,12 @@ require('dotenv').config()
 const { MongoClient, ServerApiVersion, ObjectId, } = require('mongodb');
 const app = express()
 const jwt = require('jsonwebtoken');
+const stripe = require("stripe")(process.env.PAYMENT_TOKEN_SECRET);
 const port = process.env.PORT || 5002;
+
+
+
+app.use(express.static("public"));
 
 app.use(cors());
 app.use(express.json());
@@ -27,6 +32,8 @@ async function run() {
     const reviewsCollections = client.db('bistroDb').collection('reviews');
     const cartsCollections = client.db('bistroDb').collection('carts');
     const userCollections = client.db('bistroDb').collection('user');
+    const paymentsCollections = client.db('bistroDb').collection('payments');
+
 
     const verifytoken = (req, res, next) => {
       console.log('inside verify token', req.headers.authorization);
@@ -99,6 +106,31 @@ async function run() {
 
     })
 
+
+
+    app.get('/admin-stats', verifytoken, verifyAdmin, async (req, res) => {
+      const users = await userCollections.estimatedDocumentCount();
+      const menuItems = await menuCollections.estimatedDocumentCount();
+      const orders = await paymentsCollections.estimatedDocumentCount();
+      const result = await paymentsCollections.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalRevenue: {
+              $sum: '$price'
+            }
+          }
+        }
+      ]).toArray()
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+      res.send({
+        users,
+        menuItems,
+        orders,
+        revenue
+      })
+    })
+
     app.patch('/menu/:id', verifytoken, verifyAdmin, async (req, res) => {
       const item = req.body
       const id = req.params.id;
@@ -109,10 +141,10 @@ async function run() {
           category: item.category,
           recipe: item.recipe,
           image: item.image
-       
+
         }
       }
-      const result = await menuCollections.updateOne(filter,updatedDoc);
+      const result = await menuCollections.updateOne(filter, updatedDoc);
       res.send(result)
     })
 
@@ -197,6 +229,121 @@ async function run() {
       res.send(result)
     })
 
+    app.get('/payments/:email', verifytoken, async (req, res) => {
+      const quary = { email: req.params.email };
+      if (req.params.email !== req.decoded.email) {
+        return res.status(403).send({ message: 'forbidden access' })
+      }
+      const result = await paymentsCollections.find(quary).toArray();
+
+      res.send(result)
+    })
+
+
+    app.post("/create-payment-intent", async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100)
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ['card'],
+
+      });
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+
+
+    app.post('/payments', async (req, res) => {
+      const payment = req.body;
+      payment.menuItemId= payment.menuItemId.map((id) => new ObjectId(id));
+      const paymentResult = await paymentsCollections.insertOne(payment);
+      console.log('payment;;;;;;;;;;;;;;;;', payment)
+      const quary = {
+        _id: {
+          $in: payment.cartId.map((id) => new ObjectId(id))
+        }
+      }
+
+      const delededResult = await cartsCollections.deleteMany(quary)
+
+      res.send({ paymentResult, delededResult });
+
+    })
+
+    // app.get('/order-stats', async (req, res) => {
+    //   const result = await paymentsCollections.aggregate([
+    //     {
+    //       $unwind: '$menuItemId',
+    //     },
+    //     {
+    //       $lookup: {
+    //         from: 'menu',
+    //         localField: '$menuItemId',
+    //         foreignField: '_id',
+    //         as: 'menuItems'
+    //       }
+    //     },
+    //     {
+    //       $unwind: '$menuItems',
+    //     },
+    //     {
+    //       $group: {
+    //         _id: 'menuItems.category',
+    //         quantity: {$sum: 1},
+    //         revenue: {$sum: '$menuItems.price'},
+    //       }
+    //     }
+    //   ]).toArray()
+    //   res.send(result)
+    // })
+
+
+
+    app.get('/order-stats', verifytoken,verifyAdmin, async(req, res) =>{
+      const pipeline = [
+        {
+          $unwind: '$menuItemId'
+        },
+        {
+          $lookup: {
+            from: 'menu',
+            localField: 'menuItemId',
+            foreignField: '_id',
+            as: 'menuItems'
+          }
+        },
+        {
+          $unwind: '$menuItems'
+        },
+        {
+          $group: {
+
+            _id: '$menuItems.category',
+            quantity: { $sum: 1 },
+            revenue: { $sum: '$menuItems.price' }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            category: '$_id',
+            quantity: '$quantity',
+            revenue: '$revenue'
+           
+          }
+        }
+      ];
+
+      const result = await paymentsCollections.aggregate(pipeline).toArray()
+      res.send(result)
+
+    })
+
+
+   
+  
 
 
     // Send a ping to confirm a successful connection
